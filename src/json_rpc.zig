@@ -118,6 +118,7 @@ pub fn Server(comptime LocalEndpoint: type) type {
 
         server_thread_: ?std.Thread = null,
 
+        socket_: ?xev.TCP = null,
         tp: xev.ThreadPool,
         loop: xev.Loop,
         addr: std.net.Address,
@@ -128,10 +129,10 @@ pub fn Server(comptime LocalEndpoint: type) type {
 
         active: std.atomic.Atomic(bool) = std.atomic.Atomic(bool).init(false),
 
-        pub fn init(alloc: std.mem.Allocator, addr: std.net.Address) !Server {
-            return Server{
+        pub fn init(alloc: std.mem.Allocator, addr: std.net.Address) !Self {
+            return Self{
                 .tp = xev.ThreadPool.init(.{}),
-                .loop = try xev.Loop.init(alloc),
+                .loop = try xev.Loop.init(.{}),
                 .addr = addr,
 
                 .completion_pool = std.heap.MemoryPool(xev.Completion).init(alloc),
@@ -141,31 +142,37 @@ pub fn Server(comptime LocalEndpoint: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.active.store(.Release);
+            self.active.store(false, .Release);
+            self.loop.stop();
             if (self.server_thread_) |thr| {
-                thr.join();
+                thr.detach();
             }
+            self.loop.deinit();
             self.completion_pool.deinit();
             self.socket_pool.deinit();
             self.buffer_pool.deinit();
         }
 
-        pub fn mainLoop(self: *Self) !void {
-            const socket = try xev.TCP.init(self.addr);
+        fn mainLoop(self: *Self) !void {
+            self.active.store(true, .Release);
+            self.socket_ = try xev.TCP.init(self.addr);
+            const socket = &self.socket_.?;
             try socket.bind(self.addr);
             try socket.listen(256);
             while (self.active.load(.Acquire)) {
                 const c = try self.completion_pool.create();
-                socket.accept(self.loop, c, self.addr, Self, self, acceptCallback);
+                socket.accept(&self.loop, c, Self, self, acceptCallback);
+                std.log.debug("accepting connections!", .{});
                 try self.loop.run(.until_done);
+                std.log.debug("ran through at least once", .{});
             }
         }
 
         pub fn start(self: *Self) !void {
-            self.server_thr = try std.Thread.spawn(.{}, Self.mainLoop, .{self});
+            self.server_thread_ = try std.Thread.spawn(.{}, Self.mainLoop, .{self});
         }
 
-        fn destroyBuf(self: *Server, buf: []const u8) void {
+        fn destroyBuf(self: *Self, buf: []const u8) void {
             self.buffer_pool.destroy(
                 @alignCast(
                     @as(*[4096]u8, @ptrFromInt(@intFromPtr(buf.ptr))),
@@ -179,6 +186,7 @@ pub fn Server(comptime LocalEndpoint: type) type {
             c: *xev.Completion,
             r: xev.TCP.AcceptError!xev.TCP,
         ) xev.CallbackAction {
+            std.log.debug("accept callback", .{});
             const self = self_.?;
             // Create our socket
             const socket = self.socket_pool.create() catch unreachable;
@@ -198,12 +206,12 @@ pub fn Server(comptime LocalEndpoint: type) type {
             buf: xev.ReadBuffer,
             r: xev.TCP.ReadError!usize,
         ) xev.CallbackAction {
+            std.log.debug("read callback", .{});
             const self = self_.?;
             const n = r catch |err| switch (err) {
                 error.EOF => {
                     // TODO: do we want to close the listener here? I don't think so
-                    // socket.shutdown(loop, c, Self, self, shutdownCallback);
-                    std.log.debug("buf: {s}", .{buf.slice});
+                    socket.shutdown(loop, c, Self, self, shutdownCallback);
                     self.destroyBuf(buf.slice);
                     return .disarm;
                 },
@@ -217,10 +225,12 @@ pub fn Server(comptime LocalEndpoint: type) type {
             };
 
             std.log.debug("read {} bytes", .{n});
+            std.log.debug("buf: {s}", .{buf.slice});
+
             const c_echo = self.completion_pool.create() catch unreachable;
             const buf_write = self.buffer_pool.create() catch unreachable;
             std.mem.copy(u8, buf_write, buf.slice[0..n]);
-            socket.write(loop, c_echo, .{ .slice = buf_write[0..n] }, Server, self, writeCallback);
+            socket.write(loop, c_echo, .{ .slice = buf_write[0..n] }, Self, self, writeCallback);
 
             // Read again
             return .rearm;
@@ -234,11 +244,12 @@ pub fn Server(comptime LocalEndpoint: type) type {
             buf: xev.WriteBuffer,
             r: xev.TCP.WriteError!usize,
         ) xev.CallbackAction {
-            _ = l;
             _ = s;
+            _ = l;
             _ = r catch unreachable;
 
             // We do nothing for write, just put back objects into the pool.
+            std.log.debug("write!", .{});
             const self = self_.?;
             self.completion_pool.destroy(c);
             self.buffer_pool.destroy(
@@ -246,7 +257,21 @@ pub fn Server(comptime LocalEndpoint: type) type {
                     @as(*[4096]u8, @ptrFromInt(@intFromPtr(buf.slice.ptr))),
                 ),
             );
+            // s.shutdown(l, c, Self, self, shutdownCallback);
+            // std.log.debug("queued shutdown", .{});
             return .disarm;
+        }
+
+        pub fn shutdown(self: *Self) !void {
+            self.active.store(false, .Release);
+            var c = try self.completion_pool.create();
+            if (self.socket_) |s| {
+                std.log.debug("queueing socket writer shutdown!", .{});
+                s.close(&self.loop, c, Self, self, closeCallback);
+                s.shutdown(&self.loop, c, Self, self, shutdownCallback);
+            } else {
+                std.log.debug("no socket", .{});
+            }
         }
 
         fn shutdownCallback(
@@ -256,9 +281,13 @@ pub fn Server(comptime LocalEndpoint: type) type {
             s: xev.TCP,
             r: xev.TCP.ShutdownError!void,
         ) xev.CallbackAction {
+            _ = s;
+            _ = c;
+            _ = l;
+            _ = self_;
+            std.log.debug("shutdown callback", .{});
             _ = r catch unreachable;
-            const self = self_.?;
-            s.close(l, c, Self, self, closeCallback);
+            // s.close(l, c, Self, self, closeCallback);
             return .disarm;
         }
 
@@ -269,12 +298,12 @@ pub fn Server(comptime LocalEndpoint: type) type {
             socket: xev.TCP,
             r: xev.TCP.CloseError!void,
         ) xev.CallbackAction {
+            std.log.debug("close callback", .{});
             _ = l;
             _ = r catch unreachable;
             _ = socket;
 
             const self = self_.?;
-            self.stop = true;
             self.completion_pool.destroy(c);
             return .disarm;
         }
@@ -282,82 +311,41 @@ pub fn Server(comptime LocalEndpoint: type) type {
 }
 
 pub fn RpcService(comptime LocalEndpoint: type, comptime ServerEndpoint: type) type {
-    _ = LocalEndpoint;
     return struct {
         const Self = @This();
 
+        addr: std.net.Address,
         prng: std.rand.DefaultPrng = std.rand.DefaultPrng.init(123),
-
+        server: Server(LocalEndpoint),
         started: bool = false,
 
-        pub fn init(alloc: std.mem.Allocator) !Self {
-            _ = alloc;
+        pub fn init(alloc: std.mem.Allocator, addr: std.net.Address) !Self {
             const prng = std.rand.DefaultPrng.init(blk: {
                 var seed: u64 = undefined;
                 try std.os.getrandom(std.mem.asBytes(&seed));
                 break :blk seed;
             });
-            // var tp: std.Thread.Pool = undefined;
-            // try tp.init(.{ .allocator = alloc });
             return Self{
+                .addr = addr,
+                .server = try Server(LocalEndpoint).init(alloc, addr),
                 .prng = prng,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.loop.deinit();
-            self.client.deinit();
             self.server.deinit();
-            if (self.started) self.tp.deinit();
-
-            self.completion_pool.deinit();
-            self.socket_pool.deinit();
-            self.buffer_pool.deinit();
         }
 
         pub fn start(
             self: *Self,
             alloc: std.mem.Allocator,
-            loop: *xev.Loop,
             // addr: std.net.Address,
         ) !void {
-            const address = std.net.Address.parseIp("0.0.0.0", 4321);
-            const server = xev.TCP.init(address);
-            const address2 = std.net.Address.parseIp("0.0.0.0", 1234);
-            const client = xev.TCP.init(address2);
-            _ = client;
-
-            try server.bind(address);
-            try server.listen(1);
-
-            const c_accept = try self.completion_pool.create();
-            // This returns rearm, so notice this will continue to accept connections
-            server.accept(&loop, c_accept, Self, self, (struct {
-                fn callback(
-                    ud: ?*?xev.TCP,
-                    _: *xev.Loop,
-                    _: *xev.Completion,
-                    r: xev.AcceptError!xev.TCP,
-                ) xev.CallbackAction {
-                    ud.?.* = r catch unreachable;
-                    return .rearm;
-                }
-            }).callback);
-
-            try self.tp.init(.{ .allocator = alloc });
-            self.active.store(true, .Release);
-            // try self.server.listen(addr);
-            _ = try self.tp.spawn((struct {
-                fn run(s: *Self) void {
-                    while (s.active.load(.Acquire)) {
-                        // const res = try self.server.accept(.{});
-                    }
-                }
-            }).run, .{self});
-            self.started = true;
+            _ = alloc;
+            try self.server.start();
         }
         pub fn shutdown(self: *Self) void {
-            self.active.store(false, .Release);
+            self.server.shutdown() catch unreachable;
         }
         pub fn connect() void {}
         pub fn listen() void {}
@@ -394,8 +382,28 @@ pub fn RpcService(comptime LocalEndpoint: type, comptime ServerEndpoint: type) t
     };
 }
 
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    std.log.debug("hello!", .{});
+    const addr = try std.net.Address.parseIp("0.0.0.0", 1234);
+    var rpc_service = try RpcService(Endpoint, Endpoint).init(alloc, addr);
+    std.log.debug("initted rpc service!", .{});
+    defer rpc_service.deinit();
+
+    try rpc_service.start(alloc);
+    std.log.debug("started rpc service!", .{});
+    defer rpc_service.shutdown();
+
+    const out = try rpc_service.call(.subtract, &.{ 10, 5 });
+    std.log.debug("called rpc service: {any}!", .{out});
+
+    std.time.sleep(20 * std.time.ns_per_s);
+}
+
 test RpcService {
-    var rpc_service = try RpcService(Endpoint, Endpoint).init(std.testing.allocator);
+    const addr = try std.net.Address.parseIp("0.0.0.0", 0);
+    var rpc_service = try RpcService(Endpoint, Endpoint).init(std.testing.allocator, addr);
     defer rpc_service.deinit();
     try rpc_service.start(std.testing.allocator);
     defer rpc_service.shutdown();
