@@ -114,6 +114,11 @@ test Endpoint {
 pub fn Server(comptime LocalEndpoint: type) type {
     _ = LocalEndpoint;
     return struct {
+        const http_version = "HTTP/1.1";
+        const status_ok = "200 OK";
+        const status_bad_request = "400 Bad Request";
+        const http_response_header = "Content-Type: application/json; charset=utf-8\r\n" ++
+            "Server: zig-json-rpc";
         const Self = @This();
 
         server_thread_: ?std.Thread = null,
@@ -210,7 +215,6 @@ pub fn Server(comptime LocalEndpoint: type) type {
             const self = self_.?;
             const n = r catch |err| switch (err) {
                 error.EOF => {
-                    // TODO: do we want to close the listener here? I don't think so
                     socket.shutdown(loop, c, Self, self, shutdownCallback);
                     self.destroyBuf(buf.slice);
                     return .disarm;
@@ -224,12 +228,43 @@ pub fn Server(comptime LocalEndpoint: type) type {
                 },
             };
 
+            const header_ = blk: {
+                var i: usize = 0;
+                while (i < buf.slice.len - 3) {
+                    if (std.mem.eql(u8, buf.slice[i .. i + 4], "\r\n\r\n")) break :blk i + 4;
+                    i += 1;
+                }
+                break :blk null;
+            };
             std.log.debug("read {} bytes", .{n});
-            std.log.debug("buf: {s}", .{buf.slice});
+            if (header_ == null) {
+                self.destroyBuf(buf.slice);
+                self.completion_pool.destroy(c);
+                std.log.warn("bad HTTP header format", .{});
+                return .disarm;
+            }
+            const header = buf.slice[0..header_.?];
+            const body = buf.slice[header_.?..n];
+            std.log.debug("header: {s}", .{header});
+            std.log.debug("len: {}, body: {s}", .{ body.len, body });
+            const status = if (body.len == 0) Self.status_bad_request else Self.status_ok;
 
             const c_echo = self.completion_pool.create() catch unreachable;
             const buf_write = self.buffer_pool.create() catch unreachable;
-            std.mem.copy(u8, buf_write, buf.slice[0..n]);
+            var fb = std.io.fixedBufferStream(buf_write);
+            var writer = fb.writer();
+            writer.print("{s} {s}\r\n{s}\r\nContent-Length: {}\r\n\r\n{s}\r\n\r\n", .{
+                Self.http_version,
+                status,
+                Self.http_response_header,
+                body.len,
+                body,
+            }) catch |err| {
+                self.destroyBuf(buf.slice);
+                self.completion_pool.destroy(c);
+                std.log.warn("failed to write to response buffer err={}", .{err});
+                return .disarm;
+            };
             socket.write(loop, c_echo, .{ .slice = buf_write[0..n] }, Self, self, writeCallback);
 
             // Read again
@@ -249,14 +284,11 @@ pub fn Server(comptime LocalEndpoint: type) type {
             _ = r catch unreachable;
 
             // We do nothing for write, just put back objects into the pool.
-            std.log.debug("write!", .{});
+            std.log.debug("write callback", .{});
             const self = self_.?;
             self.completion_pool.destroy(c);
-            self.buffer_pool.destroy(
-                @alignCast(
-                    @as(*[4096]u8, @ptrFromInt(@intFromPtr(buf.slice.ptr))),
-                ),
-            );
+            self.destroyBuf(buf.slice);
+            std.log.debug("destroyed buf", .{});
             // s.shutdown(l, c, Self, self, shutdownCallback);
             // std.log.debug("queued shutdown", .{});
             return .disarm;
@@ -388,7 +420,6 @@ pub fn main() !void {
     std.log.debug("hello!", .{});
     const addr = try std.net.Address.parseIp("0.0.0.0", 1234);
     var rpc_service = try RpcService(Endpoint, Endpoint).init(alloc, addr);
-    std.log.debug("initted rpc service!", .{});
     defer rpc_service.deinit();
 
     try rpc_service.start(alloc);
@@ -398,7 +429,7 @@ pub fn main() !void {
     const out = try rpc_service.call(.subtract, &.{ 10, 5 });
     std.log.debug("called rpc service: {any}!", .{out});
 
-    std.time.sleep(20 * std.time.ns_per_s);
+    if (rpc_service.server.server_thread_) |thr| thr.join();
 }
 
 test RpcService {
