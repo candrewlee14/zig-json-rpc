@@ -40,9 +40,9 @@ pub fn TypedResponse(comptime ResultT: type, comptime ErrDataT: type) type {
         const Self = @This();
 
         id: ?u32,
-        jsonrpc: []const u8,
+        jsonrpc: []const u8 = "2.0",
         result: RealResultT = if (ResultT == std.json.Value) .null else null,
-        @"error": ?Error = .null,
+        @"error": ?Error = null,
 
         const Error = struct {
             code: i32,
@@ -63,7 +63,7 @@ const Endpoint = enum {
         return switch (self) {
             .subtract => []const i32,
             .add => []const i32,
-            .ping => []const u8,
+            .ping => void,
         };
     }
     pub fn Response(comptime self: Self) type {
@@ -112,7 +112,6 @@ test Endpoint {
 }
 
 pub fn Server(comptime LocalEndpoint: type) type {
-    _ = LocalEndpoint;
     return struct {
         const http_version = "HTTP/1.1";
         const status_ok = "200 OK";
@@ -121,6 +120,7 @@ pub fn Server(comptime LocalEndpoint: type) type {
             "Server: zig-json-rpc";
         const Self = @This();
 
+        alloc: std.mem.Allocator,
         server_thread_: ?std.Thread = null,
 
         socket_: ?xev.TCP = null,
@@ -136,6 +136,7 @@ pub fn Server(comptime LocalEndpoint: type) type {
 
         pub fn init(alloc: std.mem.Allocator, addr: std.net.Address) !Self {
             return Self{
+                .alloc = alloc,
                 .tp = xev.ThreadPool.init(.{}),
                 .loop = try xev.Loop.init(.{}),
                 .addr = addr,
@@ -215,7 +216,8 @@ pub fn Server(comptime LocalEndpoint: type) type {
             const self = self_.?;
             const n = r catch |err| switch (err) {
                 error.EOF => {
-                    socket.shutdown(loop, c, Self, self, shutdownCallback);
+                    // socket.shutdown(loop, c, Self, self, shutdownCallback);
+                    self.completion_pool.destroy(c);
                     self.destroyBuf(buf.slice);
                     return .disarm;
                 },
@@ -244,28 +246,84 @@ pub fn Server(comptime LocalEndpoint: type) type {
                 return .disarm;
             }
             const header = buf.slice[0..header_.?];
+            _ = header;
             const body = buf.slice[header_.?..n];
-            std.log.debug("header: {s}", .{header});
-            std.log.debug("len: {}, body: {s}", .{ body.len, body });
             const status = if (body.len == 0) Self.status_bad_request else Self.status_ok;
 
             const c_echo = self.completion_pool.create() catch unreachable;
             const buf_write = self.buffer_pool.create() catch unreachable;
             var fb = std.io.fixedBufferStream(buf_write);
             var writer = fb.writer();
-            writer.print("{s} {s}\r\n{s}\r\nContent-Length: {}\r\n\r\n{s}\r\n\r\n", .{
-                Self.http_version,
-                status,
-                Self.http_response_header,
-                body.len,
-                body,
-            }) catch |err| {
+
+            const parsed_req = std.json.parseFromSlice(TypedRequest(std.json.Value), self.alloc, body, .{}) catch |err| {
+                // TODO: write bad request
                 self.destroyBuf(buf.slice);
                 self.completion_pool.destroy(c);
-                std.log.warn("failed to write to response buffer err={}", .{err});
+                std.log.warn("bad request, err={}", .{err});
                 return .disarm;
             };
-            socket.write(loop, c_echo, .{ .slice = buf_write[0..n] }, Self, self, writeCallback);
+            defer parsed_req.deinit();
+            const endpoint_ = LocalEndpoint.fromString(parsed_req.value.method);
+            if (endpoint_ == null) {
+                // TODO: write bad request, no such method
+                self.destroyBuf(buf.slice);
+                self.completion_pool.destroy(c);
+                std.log.warn("no such method \"{s}\"", .{parsed_req.value.method});
+                return .disarm;
+            }
+
+            var response_buf: [4096]u8 = undefined;
+            var res_fb = std.io.fixedBufferStream(response_buf[0..]);
+            var res_writer = res_fb.writer();
+
+            switch (endpoint_.?) {
+                inline else => |m| {
+                    const result = blk: {
+                        if (LocalEndpoint.Params(m) != void) {
+                            const parsed_params = std.json.parseFromValue(LocalEndpoint.Params(m), self.alloc, parsed_req.value.params, .{}) catch |err| {
+                                // TODO: write bad request, params
+                                std.log.warn("bad request, failed to parse params, err={}", .{err});
+                                return .disarm;
+                            };
+                            break :blk LocalEndpoint.route(m, parsed_params.value) catch |err| {
+                                // TODO: write internal server error
+                                std.log.warn("internal error, err={}", .{err});
+                                return .disarm;
+                            };
+                        } else {
+                            break :blk LocalEndpoint.route(m, {}) catch |err| {
+                                // TODO: write internal server error
+                                std.log.warn("internal error, err={}", .{err});
+                                return .disarm;
+                            };
+                        }
+                    };
+                    // TODO: improve error_data here
+                    const response = TypedResponse(LocalEndpoint.Response(m), []const u8){
+                        .id = parsed_req.value.id,
+                        .result = result,
+                    };
+                    std.json.stringify(response, .{}, res_writer) catch |err| {
+                        self.destroyBuf(buf.slice);
+                        self.completion_pool.destroy(c);
+                        std.log.warn("failed to write to response buffer err={}", .{err});
+                        return .disarm;
+                    };
+                    writer.print("{s} {s}\r\n{s}\r\nContent-Length: {}\r\n\r\n{s}\r\n\r\n", .{
+                        Self.http_version,
+                        status,
+                        Self.http_response_header,
+                        res_fb.pos,
+                        response_buf[0..res_fb.pos],
+                    }) catch |err| {
+                        self.destroyBuf(buf.slice);
+                        self.completion_pool.destroy(c);
+                        std.log.warn("failed to write to output buffer err={}", .{err});
+                        return .disarm;
+                    };
+                    socket.write(loop, c_echo, .{ .slice = buf_write[0..fb.pos] }, Self, self, writeCallback);
+                },
+            }
 
             // Read again
             return .rearm;
@@ -279,8 +337,6 @@ pub fn Server(comptime LocalEndpoint: type) type {
             buf: xev.WriteBuffer,
             r: xev.TCP.WriteError!usize,
         ) xev.CallbackAction {
-            _ = s;
-            _ = l;
             _ = r catch unreachable;
 
             // We do nothing for write, just put back objects into the pool.
@@ -289,7 +345,7 @@ pub fn Server(comptime LocalEndpoint: type) type {
             self.completion_pool.destroy(c);
             self.destroyBuf(buf.slice);
             std.log.debug("destroyed buf", .{});
-            // s.shutdown(l, c, Self, self, shutdownCallback);
+            s.shutdown(l, c, Self, self, shutdownCallback);
             // std.log.debug("queued shutdown", .{});
             return .disarm;
         }
@@ -313,13 +369,10 @@ pub fn Server(comptime LocalEndpoint: type) type {
             s: xev.TCP,
             r: xev.TCP.ShutdownError!void,
         ) xev.CallbackAction {
-            _ = s;
-            _ = c;
-            _ = l;
-            _ = self_;
+            const self = self_.?;
             std.log.debug("shutdown callback", .{});
             _ = r catch unreachable;
-            // s.close(l, c, Self, self, closeCallback);
+            s.close(l, c, Self, self, closeCallback);
             return .disarm;
         }
 
