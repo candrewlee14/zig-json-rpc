@@ -1,27 +1,45 @@
 const std = @import("std");
 pub const xev = @import("xev");
+pub const http = @import("./http.zig");
+pub const ExampleMethodMapping = @import("./example_endpoint.zig").MethodMapping;
 
-pub fn TypedRequest(comptime ParamsT: type) type {
+const BUF_SIZE = 4096;
+
+pub const RpcErrorCode = enum(i32) {
+    parse_error = -32700,
+    invalid_request = -32600,
+    method_not_found = -32601,
+    invalid_params = -32602,
+    internal_error = -32603,
+
+    pub fn toString(self: RpcErrorCode) []const u8 {
+        return switch (self) {
+            .parse_error => "Parse error",
+            .invalid_request => "Invalid Request",
+            .method_not_found => "Method not found",
+            .invalid_params => "Invalid params",
+            .internal_error => "Internal error",
+        };
+    }
+};
+
+pub fn Request(comptime ParamsT: type) type {
     return struct {
         const RealParamsT = if (ParamsT == std.json.Value) std.json.Value else ?ParamsT;
         const Self = @This();
 
         id: ?u32 = null,
-        jsonrpc: []const u8,
+        jsonrpc: []const u8 = "2.0",
         method: []const u8,
         params: RealParamsT = if (ParamsT == std.json.Value) .null else null,
-
-        pub fn getEndpoint(self: *const Self) ?Self {
-            return Endpoint.fromString(self.method);
-        }
     };
 }
 
-test TypedRequest {
+test Request {
     const json_str =
         \\ [{"jsonrpc": "2.0", "method": "subtract", "params": [42, 23], "id": 1}]
     ;
-    const ReqT = TypedRequest([]const i32);
+    const ReqT = Request([]const i32);
     const req = try std.json.parseFromSlice([]const ReqT, std.testing.allocator, json_str, .{});
     defer req.deinit();
     const exp_reqs: []const ReqT = &[_]ReqT{ReqT{
@@ -33,7 +51,7 @@ test TypedRequest {
     try std.testing.expectEqualDeep(exp_reqs, req.value);
 }
 
-pub fn TypedResponse(comptime ResultT: type, comptime ErrDataT: type) type {
+pub fn Response(comptime ResultT: type, comptime ErrDataT: type) type {
     return struct {
         const RealResultT = if (ResultT == std.json.Value) std.json.Value else ?ResultT;
         const RealErrDataT = if (ErrDataT == std.json.Value) std.json.Value else ?ErrDataT;
@@ -48,74 +66,29 @@ pub fn TypedResponse(comptime ResultT: type, comptime ErrDataT: type) type {
             code: i32,
             message: []const u8,
             data: RealErrDataT = if (ErrDataT == std.json.Value) .null else null,
+
+            pub fn fromRpcErrorCode(rpc_err_code: RpcErrorCode, data: RealErrDataT) Error {
+                return Error{
+                    .code = @intFromEnum(rpc_err_code),
+                    .message = rpc_err_code.toString(),
+                    .data = data,
+                };
+            }
         };
     };
 }
 
-const Endpoint = enum {
-    const Self = @This();
+const StringsResponse = Response([]const u8, []const u8);
 
-    subtract,
-    add,
-    ping,
-
-    pub fn Params(comptime self: Self) type {
-        return switch (self) {
-            .subtract => []const i32,
-            .add => []const i32,
-            .ping => void,
-        };
-    }
-    pub fn Response(comptime self: Self) type {
-        return switch (self) {
-            .subtract => i32,
-            .add => i32,
-            .ping => []const u8,
-        };
-    }
-    pub fn route(comptime endpoint: Self, params: endpoint.Params()) !endpoint.Response() {
-        return switch (endpoint) {
-            .subtract => subtract(params),
-            .add => add(params),
-            .ping => "pong",
-        };
-    }
-    pub fn fromString(str: []const u8) ?Self {
-        inline for (@typeInfo(Self).Enum.fields) |field| {
-            if (std.mem.eql(u8, field.name, str)) return @field(Self, field.name);
-        }
-        return null;
-    }
-
-    pub fn toString(self: Self) []const u8 {
-        inline for (@typeInfo(Self).Enum.fields) |field| {
-            if (field.value == @intFromEnum(self)) return field.name;
-        }
-        unreachable;
-    }
+const State = enum(u8) {
+    active,
+    shutting_down,
+    inactive,
 };
 
-fn subtract(params: []const i32) i32 {
-    return params[0] - params[1];
-}
-
-fn add(params: []const i32) i32 {
-    return params[0] + params[1];
-}
-
-test Endpoint {
-    const params: []const i32 = &.{ 15, 7 };
-    const res: i32 = try Endpoint.route(.subtract, params);
-    const res2: i32 = try Endpoint.route(.add, params);
-    try std.testing.expectEqual(@as(i32, 8), res);
-    try std.testing.expectEqual(@as(i32, 22), res2);
-}
-
-pub fn Server(comptime LocalEndpoint: type) type {
+pub fn Server(comptime LocalMethodMapping: type) type {
     return struct {
         const http_version = "HTTP/1.1";
-        const status_ok = "200 OK";
-        const status_bad_request = "400 Bad Request";
         const http_response_header = "Content-Type: application/json; charset=utf-8\r\n" ++
             "Server: zig-json-rpc";
         const Self = @This();
@@ -130,9 +103,9 @@ pub fn Server(comptime LocalEndpoint: type) type {
 
         completion_pool: std.heap.MemoryPool(xev.Completion),
         socket_pool: std.heap.MemoryPool(xev.TCP),
-        buffer_pool: std.heap.MemoryPool([4096]u8),
+        buffer_pool: std.heap.MemoryPool([BUF_SIZE]u8),
 
-        active: std.atomic.Atomic(bool) = std.atomic.Atomic(bool).init(false),
+        state: std.atomic.Atomic(State) = std.atomic.Atomic(State).init(.inactive),
 
         pub fn init(alloc: std.mem.Allocator, addr: std.net.Address) !Self {
             return Self{
@@ -143,16 +116,12 @@ pub fn Server(comptime LocalEndpoint: type) type {
 
                 .completion_pool = std.heap.MemoryPool(xev.Completion).init(alloc),
                 .socket_pool = std.heap.MemoryPool(xev.TCP).init(alloc),
-                .buffer_pool = std.heap.MemoryPool([4096]u8).init(alloc),
+                .buffer_pool = std.heap.MemoryPool([BUF_SIZE]u8).init(alloc),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.active.store(false, .Release);
             self.loop.stop();
-            if (self.server_thread_) |thr| {
-                thr.detach();
-            }
             self.loop.deinit();
             self.completion_pool.deinit();
             self.socket_pool.deinit();
@@ -160,17 +129,17 @@ pub fn Server(comptime LocalEndpoint: type) type {
         }
 
         fn mainLoop(self: *Self) !void {
-            self.active.store(true, .Release);
+            self.state.store(.active, .Release);
             self.socket_ = try xev.TCP.init(self.addr);
             const socket = &self.socket_.?;
             try socket.bind(self.addr);
             try socket.listen(256);
-            while (self.active.load(.Acquire)) {
+            while (self.state.load(.Acquire) == .active) {
                 const c = try self.completion_pool.create();
                 socket.accept(&self.loop, c, Self, self, acceptCallback);
                 std.log.debug("accepting connections!", .{});
                 try self.loop.run(.until_done);
-                std.log.debug("ran through at least once", .{});
+                std.log.debug("", .{});
             }
         }
 
@@ -178,10 +147,17 @@ pub fn Server(comptime LocalEndpoint: type) type {
             self.server_thread_ = try std.Thread.spawn(.{}, Self.mainLoop, .{self});
         }
 
+        pub fn shutdown(self: *Self) !void {
+            std.log.debug("shutting down!", .{});
+            self.state.store(.shutting_down, .Release);
+            std.log.debug("joining server thread (may be waiting on accept)", .{});
+            self.server_thread_.?.join();
+        }
+
         fn destroyBuf(self: *Self, buf: []const u8) void {
             self.buffer_pool.destroy(
                 @alignCast(
-                    @as(*[4096]u8, @ptrFromInt(@intFromPtr(buf.ptr))),
+                    @as(*[BUF_SIZE]u8, @ptrFromInt(@intFromPtr(buf.ptr))),
                 ),
             );
         }
@@ -204,129 +180,140 @@ pub fn Server(comptime LocalEndpoint: type) type {
             return .disarm;
         }
 
+        fn writeErrorResponse(
+            self: *Self,
+            writer: anytype,
+            response_buf: []u8,
+            res_fb: anytype,
+            res_writer: anytype,
+            rpc_error_code: RpcErrorCode,
+        ) !void {
+            _ = self;
+            const response = StringsResponse{ .id = null, .@"error" = StringsResponse.Error.fromRpcErrorCode(rpc_error_code, "") };
+            // write to response writer
+            try std.json.stringify(response, .{}, res_writer);
+            // use that writer's position to have a correct content-length in the output writer
+            try writer.print("{s} {} {s}\r\n{s}\r\nContent-Length: {}\r\n\r\n{s}", .{
+                Self.http_version,
+                @intFromEnum(http.Status.ok),
+                http.Status.ok.toString(),
+                Self.http_response_header,
+                res_fb.pos,
+                response_buf[0..res_fb.pos],
+            });
+        }
+
+        fn readCallbackHelper(
+            self: *Self,
+            read_buf: xev.ReadBuffer,
+            r: xev.TCP.ReadError!usize,
+            writer: anytype,
+            res_buf: []u8,
+            res_fb: anytype,
+            res_writer: anytype,
+        ) anyerror!xev.CallbackAction {
+            const n = try r;
+            const crs = "\r\n\r\n";
+
+            const header_end = if (std.mem.indexOfPos(u8, read_buf.slice, 0, crs)) |idx| idx + crs.len else return error.BadHttpHeader;
+            std.log.debug("read {} bytes", .{n});
+
+            const body = read_buf.slice[header_end..n];
+
+            const parsed_req = std.json.parseFromSlice(Request(std.json.Value), self.alloc, body, .{}) catch return error.InvalidRequest;
+            defer parsed_req.deinit();
+
+            const endpoint = LocalMethodMapping.fromString(parsed_req.value.method) orelse return error.MethodNotFound;
+
+            var status = http.Status.ok;
+            switch (endpoint) {
+                inline else => |m| {
+                    const result = try blk: {
+                        if (LocalMethodMapping.Params(m) != void) {
+                            const parsed_params = std.json.parseFromValue(
+                                LocalMethodMapping.Params(m),
+                                self.alloc,
+                                parsed_req.value.params,
+                                .{},
+                            ) catch return error.InvalidParams;
+                            defer parsed_params.deinit();
+                            break :blk LocalMethodMapping.route(m, parsed_params.value);
+                        } else {
+                            break :blk LocalMethodMapping.route(m, {});
+                        }
+                    };
+                    // TODO: improve error_data here
+                    const response = Response(LocalMethodMapping.Result(m), []const u8){
+                        .id = parsed_req.value.id,
+                        .result = result,
+                    };
+                    if (parsed_req.value.id == null) {
+                        // This is a Notification, so no need to serialize the result, but we'll still write the HTTP response below
+                        status = http.Status.accepted;
+                    } else {
+                        try std.json.stringify(response, .{}, res_writer);
+                    }
+                    try writer.print("{s} {} {s}\r\n{s}\r\nContent-Length: {}\r\n\r\n{s}", .{
+                        Self.http_version,
+                        @intFromEnum(status),
+                        status.toString(),
+                        Self.http_response_header,
+                        res_fb.pos,
+                        res_buf[0..res_fb.pos],
+                    });
+                },
+            }
+            // Read again
+            return .rearm;
+        }
+
         fn readCallback(
             self_: ?*Self,
             loop: *xev.Loop,
             c: *xev.Completion,
             socket: xev.TCP,
-            buf: xev.ReadBuffer,
+            read_buf: xev.ReadBuffer,
             r: xev.TCP.ReadError!usize,
         ) xev.CallbackAction {
             std.log.debug("read callback", .{});
             const self = self_.?;
-            const n = r catch |err| switch (err) {
-                error.EOF => {
-                    // socket.shutdown(loop, c, Self, self, shutdownCallback);
-                    self.completion_pool.destroy(c);
-                    self.destroyBuf(buf.slice);
-                    return .disarm;
-                },
 
-                else => {
-                    self.destroyBuf(buf.slice);
-                    self.completion_pool.destroy(c);
-                    std.log.warn("server read unexpected err={}", .{err});
-                    return .disarm;
-                },
-            };
-
-            const header_ = blk: {
-                var i: usize = 0;
-                while (i < buf.slice.len - 3) {
-                    if (std.mem.eql(u8, buf.slice[i .. i + 4], "\r\n\r\n")) break :blk i + 4;
-                    i += 1;
-                }
-                break :blk null;
-            };
-            std.log.debug("read {} bytes", .{n});
-            if (header_ == null) {
-                self.destroyBuf(buf.slice);
-                self.completion_pool.destroy(c);
-                std.log.warn("bad HTTP header format", .{});
+            if (self.state.load(.Acquire) != .active) {
+                socket.shutdown(&self.loop, c, Self, self, shutdownCallback);
+                self.destroyBuf(read_buf.slice);
                 return .disarm;
             }
-            const header = buf.slice[0..header_.?];
-            _ = header;
-            const body = buf.slice[header_.?..n];
-            const status = if (body.len == 0) Self.status_bad_request else Self.status_ok;
 
-            const c_echo = self.completion_pool.create() catch unreachable;
+            const c_write = self.completion_pool.create() catch unreachable;
+
             const buf_write = self.buffer_pool.create() catch unreachable;
             var fb = std.io.fixedBufferStream(buf_write);
             var writer = fb.writer();
 
-            const parsed_req = std.json.parseFromSlice(TypedRequest(std.json.Value), self.alloc, body, .{}) catch |err| {
-                // TODO: write bad request
-                self.destroyBuf(buf.slice);
-                self.completion_pool.destroy(c);
-                std.log.warn("bad request, err={}", .{err});
-                return .disarm;
-            };
-            defer parsed_req.deinit();
-            const endpoint_ = LocalEndpoint.fromString(parsed_req.value.method);
-            if (endpoint_ == null) {
-                // TODO: write bad request, no such method
-                self.destroyBuf(buf.slice);
-                self.completion_pool.destroy(c);
-                std.log.warn("no such method \"{s}\"", .{parsed_req.value.method});
-                return .disarm;
-            }
-
-            var response_buf: [4096]u8 = undefined;
+            var response_buf: [BUF_SIZE]u8 = undefined;
             var res_fb = std.io.fixedBufferStream(response_buf[0..]);
             var res_writer = res_fb.writer();
 
-            switch (endpoint_.?) {
-                inline else => |m| {
-                    const result = blk: {
-                        if (LocalEndpoint.Params(m) != void) {
-                            const parsed_params = std.json.parseFromValue(LocalEndpoint.Params(m), self.alloc, parsed_req.value.params, .{}) catch |err| {
-                                // TODO: write bad request, params
-                                std.log.warn("bad request, failed to parse params, err={}", .{err});
-                                return .disarm;
-                            };
-                            break :blk LocalEndpoint.route(m, parsed_params.value) catch |err| {
-                                // TODO: write internal server error
-                                std.log.warn("internal error, err={}", .{err});
-                                return .disarm;
-                            };
-                        } else {
-                            break :blk LocalEndpoint.route(m, {}) catch |err| {
-                                // TODO: write internal server error
-                                std.log.warn("internal error, err={}", .{err});
-                                return .disarm;
-                            };
-                        }
-                    };
-                    // TODO: improve error_data here
-                    const response = TypedResponse(LocalEndpoint.Response(m), []const u8){
-                        .id = parsed_req.value.id,
-                        .result = result,
-                    };
-                    std.json.stringify(response, .{}, res_writer) catch |err| {
-                        self.destroyBuf(buf.slice);
-                        self.completion_pool.destroy(c);
-                        std.log.warn("failed to write to response buffer err={}", .{err});
-                        return .disarm;
-                    };
-                    writer.print("{s} {s}\r\n{s}\r\nContent-Length: {}\r\n\r\n{s}\r\n\r\n", .{
-                        Self.http_version,
-                        status,
-                        Self.http_response_header,
-                        res_fb.pos,
-                        response_buf[0..res_fb.pos],
-                    }) catch |err| {
-                        self.destroyBuf(buf.slice);
-                        self.completion_pool.destroy(c);
-                        std.log.warn("failed to write to output buffer err={}", .{err});
-                        return .disarm;
-                    };
-                    socket.write(loop, c_echo, .{ .slice = buf_write[0..fb.pos] }, Self, self, writeCallback);
-                },
+            if (self.readCallbackHelper(read_buf, r, writer, &response_buf, res_fb, res_writer)) |action| {
+                socket.write(loop, c_write, .{ .slice = buf_write[0..fb.pos] }, Self, self, writeCallback);
+                return action;
+            } else |err| {
+                defer self.completion_pool.destroy(c);
+                defer self.destroyBuf(read_buf.slice);
+                const rpc_err_code = switch (err) {
+                    error.InvalidParams => RpcErrorCode.invalid_params,
+                    error.InvalidRequest => RpcErrorCode.invalid_request,
+                    error.BadHttpHeader => RpcErrorCode.parse_error,
+                    error.MethodNotFound => RpcErrorCode.method_not_found,
+                    else => RpcErrorCode.internal_error,
+                };
+                self.writeErrorResponse(writer, &response_buf, res_fb, res_writer, rpc_err_code) catch |w_err| {
+                    std.log.warn("failed to write error response, err={}", .{w_err});
+                    return .disarm;
+                };
+                socket.write(loop, c_write, .{ .slice = buf_write[0..fb.pos] }, Self, self, writeCallback);
+                return .disarm;
             }
-
-            // Read again
-            return .rearm;
         }
 
         fn writeCallback(
@@ -337,29 +324,23 @@ pub fn Server(comptime LocalEndpoint: type) type {
             buf: xev.WriteBuffer,
             r: xev.TCP.WriteError!usize,
         ) xev.CallbackAction {
-            _ = r catch unreachable;
+            _ = s;
+            _ = l;
+            const self = self_.?;
+            if (self.state.load(.Acquire) != .active) {
+                self.destroyBuf(buf.slice);
+                return .disarm;
+            }
+            std.log.debug("write callback", .{});
+            _ = r catch |err| {
+                std.log.warn("write error, err={}", .{err});
+            };
 
             // We do nothing for write, just put back objects into the pool.
-            std.log.debug("write callback", .{});
-            const self = self_.?;
             self.completion_pool.destroy(c);
             self.destroyBuf(buf.slice);
             std.log.debug("destroyed buf", .{});
-            s.shutdown(l, c, Self, self, shutdownCallback);
-            // std.log.debug("queued shutdown", .{});
             return .disarm;
-        }
-
-        pub fn shutdown(self: *Self) !void {
-            self.active.store(false, .Release);
-            var c = try self.completion_pool.create();
-            if (self.socket_) |s| {
-                std.log.debug("queueing socket writer shutdown!", .{});
-                s.close(&self.loop, c, Self, self, closeCallback);
-                s.shutdown(&self.loop, c, Self, self, shutdownCallback);
-            } else {
-                std.log.debug("no socket", .{});
-            }
         }
 
         fn shutdownCallback(
@@ -370,8 +351,18 @@ pub fn Server(comptime LocalEndpoint: type) type {
             r: xev.TCP.ShutdownError!void,
         ) xev.CallbackAction {
             const self = self_.?;
+            const state_ = self.state.compareAndSwap(.shutting_down, .inactive, .AcqRel, .Acquire);
+            if (state_) |state| {
+                if (state == .inactive) {
+                    self.completion_pool.destroy(c);
+                    return .disarm;
+                }
+            }
             std.log.debug("shutdown callback", .{});
-            _ = r catch unreachable;
+            _ = r catch |err| {
+                std.log.warn("shutdown failed, err={}", .{err});
+                unreachable;
+            };
             s.close(l, c, Self, self, closeCallback);
             return .disarm;
         }
@@ -390,18 +381,19 @@ pub fn Server(comptime LocalEndpoint: type) type {
 
             const self = self_.?;
             self.completion_pool.destroy(c);
+            self.state.store(.inactive, .Release);
             return .disarm;
         }
     };
 }
 
-pub fn RpcService(comptime LocalEndpoint: type, comptime ServerEndpoint: type) type {
+pub fn RpcService(comptime LocalMethodMapping: type, comptime ServerMethodMapping: type) type {
     return struct {
         const Self = @This();
 
         addr: std.net.Address,
         prng: std.rand.DefaultPrng = std.rand.DefaultPrng.init(123),
-        server: Server(LocalEndpoint),
+        server: Server(LocalMethodMapping),
         started: bool = false,
 
         pub fn init(alloc: std.mem.Allocator, addr: std.net.Address) !Self {
@@ -412,7 +404,7 @@ pub fn RpcService(comptime LocalEndpoint: type, comptime ServerEndpoint: type) t
             });
             return Self{
                 .addr = addr,
-                .server = try Server(LocalEndpoint).init(alloc, addr),
+                .server = try Server(LocalMethodMapping).init(alloc, addr),
                 .prng = prng,
             };
         }
@@ -434,16 +426,13 @@ pub fn RpcService(comptime LocalEndpoint: type, comptime ServerEndpoint: type) t
         }
         pub fn connect() void {}
         pub fn listen() void {}
-        pub fn call(self: *Self, comptime endpoint: ServerEndpoint, params: endpoint.Params()) !endpoint.Response() {
+        pub fn call(self: *Self, comptime endpoint: ServerMethodMapping, params: endpoint.Params()) !endpoint.Result() {
             const ParamsT = endpoint.Params();
-            const ResponseT = endpoint.Response();
-            _ = ResponseT;
             // Caller
             // - Build Request
             const rand = self.prng.random();
-            const req = TypedRequest(ParamsT){
+            const req = Request(ParamsT){
                 .id = rand.int(u32),
-                .jsonrpc = "2.0",
                 .method = endpoint.toString(),
                 .params = params,
             };
@@ -462,7 +451,8 @@ pub fn RpcService(comptime LocalEndpoint: type, comptime ServerEndpoint: type) t
             //
             // Profit!
             //
-            return Endpoint.route(endpoint, params);
+            return ServerMethodMapping.route(endpoint, params);
+            // return error.Unimplemented;
         }
     };
 }
@@ -472,7 +462,7 @@ pub fn main() !void {
     const alloc = gpa.allocator();
     std.log.debug("hello!", .{});
     const addr = try std.net.Address.parseIp("0.0.0.0", 1234);
-    var rpc_service = try RpcService(Endpoint, Endpoint).init(alloc, addr);
+    var rpc_service = try RpcService(ExampleMethodMapping, ExampleMethodMapping).init(alloc, addr);
     defer rpc_service.deinit();
 
     try rpc_service.start(alloc);
@@ -482,12 +472,12 @@ pub fn main() !void {
     const out = try rpc_service.call(.subtract, &.{ 10, 5 });
     std.log.debug("called rpc service: {any}!", .{out});
 
-    if (rpc_service.server.server_thread_) |thr| thr.join();
+    std.time.sleep(3 * std.time.ns_per_s);
 }
 
 test RpcService {
     const addr = try std.net.Address.parseIp("0.0.0.0", 0);
-    var rpc_service = try RpcService(Endpoint, Endpoint).init(std.testing.allocator, addr);
+    var rpc_service = try RpcService(ExampleMethodMapping, ExampleMethodMapping).init(std.testing.allocator, addr);
     defer rpc_service.deinit();
     try rpc_service.start(std.testing.allocator);
     defer rpc_service.shutdown();
