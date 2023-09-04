@@ -1,0 +1,10 @@
+.{
+    .name = "zig-json-rpc",
+    .version = "0.0.0",
+    .dependencies = .{
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/32e67d79ec11d3e976a89b10b4a0c50d2d66ec75.tar.gz",
+            .hash = "1220ecb47006f929219032ca65cf24854fdc524356cd0758272bb10eda7f0893e80d",
+        },
+    },
+}
