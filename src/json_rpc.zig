@@ -151,6 +151,10 @@ pub fn Server(comptime LocalMethodMapping: type) type {
             std.log.debug("shutting down!", .{});
             self.state.store(.shutting_down, .Release);
             std.log.debug("joining server thread (may be waiting on accept)", .{});
+            // ignore error, we just want to end the accept loop
+            if (std.net.tcpConnectToAddress(self.addr) catch null) |stream| {
+                stream.close();
+            }
             self.server_thread_.?.join();
         }
 
