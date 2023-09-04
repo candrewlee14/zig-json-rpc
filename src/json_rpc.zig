@@ -92,6 +92,7 @@ pub fn Server(comptime LocalMethodMapping: type) type {
         const http_response_header = "Content-Type: application/json; charset=utf-8\r\n" ++
             "Server: zig-json-rpc";
         const Self = @This();
+        const logger = std.log.scoped(.rpc_server);
 
         alloc: std.mem.Allocator,
         server_thread_: ?std.Thread = null,
@@ -104,6 +105,9 @@ pub fn Server(comptime LocalMethodMapping: type) type {
         completion_pool: std.heap.MemoryPool(xev.Completion),
         socket_pool: std.heap.MemoryPool(xev.TCP),
         buffer_pool: std.heap.MemoryPool([BUF_SIZE]u8),
+
+        accepted_connections: usize = 0,
+        response_count: usize = 0,
 
         state: std.atomic.Atomic(State) = std.atomic.Atomic(State).init(.inactive),
 
@@ -137,9 +141,9 @@ pub fn Server(comptime LocalMethodMapping: type) type {
             while (self.state.load(.Acquire) == .active) {
                 const c = try self.completion_pool.create();
                 socket.accept(&self.loop, c, Self, self, acceptCallback);
-                std.log.debug("accepting connections!", .{});
+                logger.debug("accepting connections!", .{});
                 try self.loop.run(.until_done);
-                std.log.debug("", .{});
+                logger.debug("", .{});
             }
         }
 
@@ -148,9 +152,9 @@ pub fn Server(comptime LocalMethodMapping: type) type {
         }
 
         pub fn shutdown(self: *Self) !void {
-            std.log.debug("shutting down!", .{});
+            logger.debug("shutting down!", .{});
             self.state.store(.shutting_down, .Release);
-            std.log.debug("joining server thread (may be waiting on accept)", .{});
+            logger.debug("joining server thread (may be waiting on accept)", .{});
             // ignore error, we just want to end the accept loop
             if (std.net.tcpConnectToAddress(self.addr) catch null) |stream| {
                 stream.close();
@@ -172,8 +176,9 @@ pub fn Server(comptime LocalMethodMapping: type) type {
             c: *xev.Completion,
             r: xev.TCP.AcceptError!xev.TCP,
         ) xev.CallbackAction {
-            std.log.debug("accept callback", .{});
+            logger.debug("accept callback", .{});
             const self = self_.?;
+            self.accepted_connections += 1;
             // Create our socket
             const socket = self.socket_pool.create() catch unreachable;
             socket.* = r catch unreachable;
@@ -193,6 +198,7 @@ pub fn Server(comptime LocalMethodMapping: type) type {
             rpc_error_code: RpcErrorCode,
         ) !void {
             _ = self;
+            logger.warn("writing error response", .{});
             const response = StringsResponse{ .id = null, .@"error" = StringsResponse.Error.fromRpcErrorCode(rpc_error_code, "") };
             // write to response writer
             try std.json.stringify(response, .{}, res_writer);
@@ -219,10 +225,12 @@ pub fn Server(comptime LocalMethodMapping: type) type {
             const n = try r;
             const crs = "\r\n\r\n";
 
+            logger.debug("read {} bytes: {s}", .{ n, read_buf.slice[0..n] });
+
             const header_end = if (std.mem.indexOfPos(u8, read_buf.slice, 0, crs)) |idx| idx + crs.len else return error.BadHttpHeader;
-            std.log.debug("read {} bytes", .{n});
 
             const body = read_buf.slice[header_end..n];
+            logger.debug("body: {s}", .{body});
 
             const parsed_req = std.json.parseFromSlice(Request(std.json.Value), self.alloc, body, .{}) catch return error.InvalidRequest;
             defer parsed_req.deinit();
@@ -279,7 +287,7 @@ pub fn Server(comptime LocalMethodMapping: type) type {
             read_buf: xev.ReadBuffer,
             r: xev.TCP.ReadError!usize,
         ) xev.CallbackAction {
-            std.log.debug("read callback", .{});
+            logger.debug("read callback", .{});
             const self = self_.?;
 
             if (self.state.load(.Acquire) != .active) {
@@ -312,7 +320,7 @@ pub fn Server(comptime LocalMethodMapping: type) type {
                     else => RpcErrorCode.internal_error,
                 };
                 self.writeErrorResponse(writer, &response_buf, res_fb, res_writer, rpc_err_code) catch |w_err| {
-                    std.log.warn("failed to write error response, err={}", .{w_err});
+                    logger.warn("failed to write error response, err={}", .{w_err});
                     return .disarm;
                 };
                 socket.write(loop, c_write, .{ .slice = buf_write[0..fb.pos] }, Self, self, writeCallback);
@@ -335,15 +343,16 @@ pub fn Server(comptime LocalMethodMapping: type) type {
                 self.destroyBuf(buf.slice);
                 return .disarm;
             }
-            std.log.debug("write callback", .{});
+            logger.debug("write callback", .{});
             _ = r catch |err| {
-                std.log.warn("write error, err={}", .{err});
+                logger.warn("write error, err={}", .{err});
             };
 
             // We do nothing for write, just put back objects into the pool.
             self.completion_pool.destroy(c);
             self.destroyBuf(buf.slice);
-            std.log.debug("destroyed buf", .{});
+            logger.debug("destroyed buf", .{});
+            self.response_count += 1;
             return .disarm;
         }
 
@@ -362,9 +371,9 @@ pub fn Server(comptime LocalMethodMapping: type) type {
                     return .disarm;
                 }
             }
-            std.log.debug("shutdown callback", .{});
+            logger.debug("shutdown callback", .{});
             _ = r catch |err| {
-                std.log.warn("shutdown failed, err={}", .{err});
+                logger.warn("shutdown failed, err={}", .{err});
                 unreachable;
             };
             s.close(l, c, Self, self, closeCallback);
@@ -378,7 +387,7 @@ pub fn Server(comptime LocalMethodMapping: type) type {
             socket: xev.TCP,
             r: xev.TCP.CloseError!void,
         ) xev.CallbackAction {
-            std.log.debug("close callback", .{});
+            logger.debug("close callback", .{});
             _ = l;
             _ = r catch unreachable;
             _ = socket;
@@ -395,6 +404,9 @@ pub fn RpcService(comptime LocalMethodMapping: type, comptime ServerMethodMappin
     return struct {
         const Self = @This();
 
+        const logger = std.log.scoped(.rpc_client);
+
+        alloc: std.mem.Allocator,
         addr: std.net.Address,
         prng: std.rand.DefaultPrng = std.rand.DefaultPrng.init(123),
         server: Server(LocalMethodMapping),
@@ -407,6 +419,7 @@ pub fn RpcService(comptime LocalMethodMapping: type, comptime ServerMethodMappin
                 break :blk seed;
             });
             return Self{
+                .alloc = alloc,
                 .addr = addr,
                 .server = try Server(LocalMethodMapping).init(alloc, addr),
                 .prng = prng,
@@ -430,38 +443,79 @@ pub fn RpcService(comptime LocalMethodMapping: type, comptime ServerMethodMappin
         }
         pub fn connect() void {}
         pub fn listen() void {}
-        pub fn call(self: *Self, comptime endpoint: ServerMethodMapping, params: endpoint.Params()) !endpoint.Result() {
+        pub fn call(self: *Self, addr: std.net.Address, comptime endpoint: ServerMethodMapping, params: endpoint.Params()) !endpoint.Result() {
             const ParamsT = endpoint.Params();
-            // Caller
-            // - Build Request
             const rand = self.prng.random();
             const req = Request(ParamsT){
                 .id = rand.int(u32),
                 .method = endpoint.toString(),
                 .params = params,
             };
-            _ = req;
-            // - Serialize Request
-            // - Send over stream
-            // Callee
-            // - Read from stream
-            // - Deserialize Request
-            // - Route to proper method
-            // - Serialize Response
-            // - Send back over stream
-            // Caller
-            // - Read from stream
-            // - Deserialize Response
-            //
-            // Profit!
-            //
-            return ServerMethodMapping.route(endpoint, params);
-            // return error.Unimplemented;
+            const stream = try std.net.tcpConnectToAddress(addr);
+            defer stream.close();
+
+            var w = stream.writer();
+            // write HTTP headers
+            logger.debug("writing request", .{});
+            var out_buf: [BUF_SIZE]u8 = undefined;
+            var out_stream = std.io.fixedBufferStream(out_buf[0..]);
+            var out_writer = out_stream.writer();
+            try std.json.stringify(req, .{}, out_writer);
+            const w_pos = try out_stream.getPos();
+            try w.print("POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{s}", .{
+                addr,
+                w_pos,
+                out_buf[0..w_pos],
+            });
+            logger.debug("wrote request: {s}", .{out_buf[0..w_pos]});
+            var read_buf: [BUF_SIZE]u8 = undefined;
+            logger.debug("reading response", .{});
+            const n = try stream.read(&read_buf);
+            logger.debug("read {} bytes in response: {s}", .{ n, read_buf[0..n] });
+            const crs = "\r\n\r\n";
+            const header_end = if (std.mem.indexOfPos(u8, &read_buf, 0, crs)) |idx| idx + crs.len else return error.BadHttpHeader;
+            const body = read_buf[header_end..n];
+            logger.debug("response body: {s}", .{body});
+            const parsed = try std.json.parseFromSlice(Response(endpoint.Result(), []const u8), self.alloc, body, .{});
+            defer parsed.deinit();
+
+            logger.debug("parsed response: {any}", .{parsed.value});
+
+            if (parsed.value.id != null and parsed.value.id != req.id) {
+                return error.MismatchId;
+            }
+            if (parsed.value.@"error") |err| {
+                logger.warn("error response: {any}", .{err});
+                return error.RpcError;
+            }
+            if (parsed.value.result) |res| {
+                return res;
+            }
+            return error.InvalidResponse;
         }
     };
 }
 
 pub fn main() !void {
+    const addr2 = try std.net.Address.parseIp("0.0.0.0", 4321);
+    const handle = try std.Thread.spawn(.{}, struct {
+        pub fn threadMain() !void {
+            const addr = try std.net.Address.parseIp("0.0.0.0", 4321);
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            const alloc = gpa.allocator();
+            var rpc_service = try RpcService(ExampleMethodMapping, ExampleMethodMapping).init(alloc, addr);
+            defer rpc_service.deinit();
+
+            try rpc_service.start(alloc);
+            std.log.debug("started thread for rpc service!", .{});
+            defer rpc_service.shutdown();
+
+            while (rpc_service.server.response_count < 1) {
+                std.time.sleep(25 * std.time.ms_per_s);
+            }
+        }
+    }.threadMain, .{});
+    std.time.sleep(100 * std.time.ms_per_s);
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
     std.log.debug("hello!", .{});
@@ -473,18 +527,48 @@ pub fn main() !void {
     std.log.debug("started rpc service!", .{});
     defer rpc_service.shutdown();
 
-    const out = try rpc_service.call(.subtract, &.{ 10, 5 });
+    const out = try rpc_service.call(addr2, .subtract, &.{ 10, 5 });
     std.log.debug("called rpc service: {any}!", .{out});
 
-    std.time.sleep(3 * std.time.ns_per_s);
+    handle.join();
 }
 
 test RpcService {
-    const addr = try std.net.Address.parseIp("0.0.0.0", 0);
-    var rpc_service = try RpcService(ExampleMethodMapping, ExampleMethodMapping).init(std.testing.allocator, addr);
+    const addr2 = try std.net.Address.parseIp("0.0.0.0", 4321);
+    const handle = try std.Thread.spawn(.{}, struct {
+        pub fn threadMain() !void {
+            const addr = try std.net.Address.parseIp("0.0.0.0", 4321);
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            const alloc = gpa.allocator();
+            var rpc_service = try RpcService(ExampleMethodMapping, ExampleMethodMapping).init(alloc, addr);
+            defer rpc_service.deinit();
+
+            try rpc_service.start(alloc);
+            std.log.debug("started thread for rpc service!", .{});
+            defer rpc_service.shutdown();
+
+            while (rpc_service.server.response_count < 1) {
+                std.time.sleep(25 * std.time.ms_per_s);
+            }
+        }
+    }.threadMain, .{});
+
+    std.time.sleep(100 * std.time.ms_per_s);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    std.log.debug("hello!", .{});
+    const addr = try std.net.Address.parseIp("0.0.0.0", 1234);
+    var rpc_service = try RpcService(ExampleMethodMapping, ExampleMethodMapping).init(alloc, addr);
     defer rpc_service.deinit();
-    try rpc_service.start(std.testing.allocator);
+
+    try rpc_service.start(alloc);
+    std.log.debug("started rpc service!", .{});
     defer rpc_service.shutdown();
-    const out = try rpc_service.call(.subtract, &.{ 10, 5 });
-    _ = out;
+
+    const out = try rpc_service.call(addr2, .subtract, &.{ 10, 5 });
+    std.log.debug("called rpc method, got {any}!", .{out});
+
+    try std.testing.expectEqual(@as(i32, 5), out);
+
+    handle.join();
 }
